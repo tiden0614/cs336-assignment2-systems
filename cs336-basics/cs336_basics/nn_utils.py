@@ -1,4 +1,46 @@
 import torch
+import torch.cuda.nvtx as nvtx
+from torch.profiler import record_function
+
+
+class profile_range:
+    """Combined NVTX range + torch.profiler record_function.
+
+    Works as both a context manager and a decorator.
+    Shows up in both Nsight Systems (NVTX row) and torch.profiler Chrome traces.
+
+    Usage:
+        @profile_range("my_func")
+        def my_func(...): ...
+
+        with profile_range("my_block"):
+            ...
+    """
+
+    def __init__(self, label: str):
+        self.label = label
+        # Pre-build the decorator chain so the decorated function itself
+        # is the call site (not wrapper code in this file), giving
+        # torch.profiler correct stack attribution.
+        self._nvtx_decorator = nvtx.range(label)
+        self._rf_decorator = record_function(label)
+
+    # -- context manager --
+    def __enter__(self):
+        self._nvtx_decorator.__enter__()
+        self._rf_decorator.__enter__()
+        return self
+
+    def __exit__(self, *args):
+        self._rf_decorator.__exit__(*args)
+        self._nvtx_decorator.__exit__(*args)
+
+    # -- decorator --
+    def __call__(self, fn):
+        # Stack nvtx and record_function as decorators directly.
+        # record_function.__call__ and nvtx.range.__call__ each wrap fn,
+        # so the profiler sees the decorated function's call site, not ours.
+        return self._nvtx_decorator(self._rf_decorator(fn))
 
 
 def softmax(x, dim=-1):

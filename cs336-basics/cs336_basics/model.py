@@ -12,9 +12,7 @@ import torch
 import torch.nn as nn
 from torch import Tensor
 from jaxtyping import Float, Bool, Int
-
-
-from .nn_utils import softmax
+from .nn_utils import softmax, profile_range
 
 logger = logging.getLogger(__name__)
 
@@ -53,6 +51,7 @@ class Embedding(nn.Module):
             requires_grad=True
         )
     
+    @profile_range("embedding_forward")
     def forward(self, token_ids: Int[Tensor, " ..."]) -> Float[Tensor, " ... d_model"]:
         return self.weight[token_ids, :]
     
@@ -85,6 +84,7 @@ class RMSNorm(nn.Module):
         self.weight = nn.Parameter(torch.ones(hidden_size, device=device))
         self.eps = eps
 
+    @profile_range("rms_norm_forward")
     def forward(self, x):
         """
         Args:
@@ -131,6 +131,7 @@ class RotaryEmbedding(nn.Module):
         cos, sin = torch.cos(freqs), torch.sin(freqs)
         return torch.stack((cos, sin))
 
+    @profile_range("rotary_embedding_forward")
     def forward(self, x: Float[Tensor, " ... seq d"], pos_ids: Int[Tensor, " ... seq"]) -> Float[Tensor, " ... seq d"]:
         x1, x2 = rearrange(x, '... (half_d xy) -> xy ... half_d', xy=2)
 
@@ -393,10 +394,12 @@ class SwiGLU(nn.Module):
         self.w2 = Linear(d_ff, d_model)
         self.w3 = Linear(d_model, d_ff)
 
+    @profile_range("swiglu_forward")
     def forward(self, x):
         return self.w2(silu(self.w1(x)) * self.w3(x))
 
 
+@profile_range("scaled_dot_product_attention")
 def scaled_dot_product_attention(
     Q: Float[Tensor, " ... queries d_k"],
     K: Float[Tensor, " ... keys    d_k"],
@@ -422,14 +425,18 @@ def scaled_dot_product_attention(
     """
 
     d_k = K.shape[-1]
-    attention_scores = einsum(Q, K, "... query d_k, ... key d_k -> ... query key") / math.sqrt(d_k)
+    with profile_range("attention_scores_computation"):
+        attention_scores = einsum(Q, K, "... query d_k, ... key d_k -> ... query key") / math.sqrt(d_k)
 
     if mask is not None:
-        attention_scores = torch.where(mask, attention_scores, float("-inf"))
+        with profile_range("masking"):
+            attention_scores = torch.where(mask, attention_scores, float("-inf"))
 
-    attention_weights = softmax(attention_scores, dim=-1)  # Softmax over the key dimension
+    with profile_range("attention_weights_computation"):
+        attention_weights = softmax(attention_scores, dim=-1)  # Softmax over the key dimension
 
-    return einsum(attention_weights, V, "... query key, ... key d_v ->  ... query d_v")
+    with profile_range("attention_output_computation"):
+        return einsum(attention_weights, V, "... query key, ... key d_v ->  ... query d_v")
 
 
 class CausalMultiHeadSelfAttention(nn.Module):
@@ -475,6 +482,7 @@ class CausalMultiHeadSelfAttention(nn.Module):
 
         self.positional_encoder = positional_encoder  # RoPE
 
+    @profile_range("self_attention_forward")
     def forward(self, x: Float[Tensor, " ... seq d_k"], token_positions: Int[Tensor, " ... seq"] | None = None) -> Float[Tensor, " ... seq d_v"]:
         """
         Args:
@@ -487,15 +495,17 @@ class CausalMultiHeadSelfAttention(nn.Module):
         *b, sequence_length, d_model = x.size()
         assert d_model == self.d_model
 
-        Q = self.q_proj(x)
-        K = self.k_proj(x)
-        V = self.v_proj(x)
+        with profile_range("qkv_projection"):
+            Q = self.q_proj(x)
+            K = self.k_proj(x)
+            V = self.v_proj(x)
 
-        # Take apart each head from the embedding dimension of Q, K, V to shape (..., num_heads, seq_len, d_k).
-        Q, K, V = (
-            rearrange(X, "... seq (heads d) -> ... heads seq d", heads=self.num_heads)
-            for X in (Q, K, V)
-        )  # fmt: skip
+        with profile_range("qkv_reshaping"):
+            # Take apart each head from the embedding dimension of Q, K, V to shape (..., num_heads, seq_len, d_k).
+            Q, K, V = (
+                rearrange(X, "... seq (heads d) -> ... heads seq d", heads=self.num_heads)
+                for X in (Q, K, V)
+            )  # fmt: skip
 
         if token_positions is None:
             token_positions = einx.rearrange("seq -> b... seq", torch.arange(sequence_length, device=x.device), b=[1] * len(b))
@@ -503,24 +513,28 @@ class CausalMultiHeadSelfAttention(nn.Module):
         # Duplicate token positions for each head
         token_positions = rearrange(token_positions, "... seq -> ... 1 seq")
 
-        Q = self.positional_encoder(Q, token_positions)
-        K = self.positional_encoder(K, token_positions)
+        with profile_range("rotary_embedding_forward"):
+            Q = self.positional_encoder(Q, token_positions)
+            K = self.positional_encoder(K, token_positions)
 
         # Construct causal mask
-        seq = torch.arange(sequence_length, device=x.device)
-        qi = einx.rearrange('query -> b... 1 query 1', seq, b=[1] * len(b))
-        kj = einx.rearrange('key   -> b... 1 1   key', seq, b=[1] * len(b))
-        causal_mask = qi >= kj  # (query, key)
+        with profile_range("causal_mask_construction"):
+            seq = torch.arange(sequence_length, device=x.device)
+            qi = einx.rearrange('query -> b... 1 query 1', seq, b=[1] * len(b))
+            kj = einx.rearrange('key   -> b... 1 1   key', seq, b=[1] * len(b))
+            causal_mask = qi >= kj  # (query, key)
 
         # Shape: (..., num_heads, sequence_length, d_k)
         attn_output = scaled_dot_product_attention(K=K, Q=Q, V=V, mask=causal_mask)
 
         # Concatenate the attention output from all heads.
         # (..., sequence_length, num_heads * d_v).
-        attn_output = rearrange(attn_output, "batch heads seq d_v -> batch seq (heads d_v)").contiguous()
+        with profile_range("attn_output_reshaping"):
+            attn_output = rearrange(attn_output, "batch heads seq d_v -> batch seq (heads d_v)").contiguous()
 
         # Apply the output projection
-        output = self.output_proj(attn_output)
+        with profile_range("output_projection"):
+            output = self.output_proj(attn_output)
         return output
 
 def silu(x: torch.Tensor):

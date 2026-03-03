@@ -12,6 +12,8 @@ CLI args (single):
     --num_steps      Timed iterations (default: 10)
     --device         cpu | cuda (default: cuda)
     --iter_output    Path to save per-iteration times as CSV (optional, single only)
+    --profile        Enable torch.profiler with Python stack traces
+    --trace_output   Chrome trace output path (default: trace.json, requires --profile)
 
 CLI args (sweep):
     --model_sizes       Space-separated list (default: all)
@@ -37,12 +39,30 @@ Example commands:
 
     # Single with per-iteration CSV dump
     uv run python -m cs336_systems.benchmark single --model_size small --context_length 128 --iter_output iters.csv
+
+    # Profile with torch.profiler (outputs Chrome trace with Python stacks)
+    uv run nsys profile  \
+      --python-sampling=true  \
+      --python-backtrace=cuda  \
+      --sample=cpu  \
+      --cpuctxsw=process-tree  \
+      -o result-with-pt-stack2  \
+    python -m cs336_systems.benchmark single  \
+      --model_size small \
+      --context_length 128 \
+      --device cuda:0  \
+      --num_warmup 10 \
+      --num_steps 100 \
+      --mode both \
+      --profile \
+      --trace_output trace.json
+    # Then open trace.json in chrome://tracing or https://ui.perfetto.dev
 """
 
 import argparse
 import csv
-import io
 import itertools
+import json
 import timeit
 
 import torch
@@ -82,6 +102,7 @@ def benchmark(
     num_warmup: int,
     num_steps: int,
     device: str,
+    trace_output: str | None = None,
 ) -> dict[str, float]:
     dev = torch.device(device)
     model = build_model(model_size, context_length, dev)
@@ -109,6 +130,19 @@ def benchmark(
         model.zero_grad(set_to_none=True)
 
     # Measure
+    profiling = trace_output is not None
+    prof_ctx = None
+    if profiling:
+        activities = [torch.profiler.ProfilerActivity.CPU]
+        if is_cuda:
+            activities.append(torch.profiler.ProfilerActivity.CUDA)
+        prof_ctx = torch.profiler.profile(
+            activities=activities,
+            with_stack=True,
+            record_shapes=True,
+        )
+        prof_ctx.__enter__()
+
     timer = timeit.default_timer
     times = []
     for _ in range(num_steps):
@@ -117,6 +151,72 @@ def benchmark(
         elapsed = timer() - start
         times.append(elapsed)
         model.zero_grad(set_to_none=True)
+
+    if profiling:
+        prof_ctx.__exit__(None, None, None)
+
+        # Export raw trace, then strip python_function events that cause
+        # Perfetto to drop overlapping events (including CUDA kernels).
+        raw_trace = trace_output.replace(".json", ".raw.json")
+        prof_ctx.export_chrome_trace(raw_trace)
+
+        with open(raw_trace) as f:
+            trace_data = json.load(f)
+
+        # Post-process to fix Perfetto rendering:
+        # 1. Move python_function events to separate pid (avoids overlapping drops)
+        # 2. Move GPU events to a distinct pid with clear naming
+        GPU_PID = 999999
+        PYTHON_PID = 999998
+        cpu_pid = None
+        events = []
+        for e in trace_data.get("traceEvents", []):
+            cat = e.get("cat", "")
+            # Move python_function events to their own process
+            if cat == "python_function":
+                e["pid"] = PYTHON_PID
+                events.append(e)
+                continue
+            # Remap GPU events (pid 0) to a unique pid, drop old metadata
+            if e.get("pid") == 0:
+                if e.get("ph") == "M":
+                    continue  # drop old GPU process metadata
+                e["pid"] = GPU_PID
+            elif cat == "cpu_op" and cpu_pid is None:
+                cpu_pid = e.get("pid")
+            # Remap ac2g flow arrows to point to new GPU pid
+            if cat == "ac2g" and e.get("ph") == "f":
+                e["pid"] = GPU_PID
+            events.append(e)
+
+        # Add process metadata
+        events.extend([
+            {"name": "process_name", "ph": "M", "pid": GPU_PID, "tid": 0,
+             "args": {"name": "GPU 0 (CUDA)"}},
+            {"name": "process_sort_index", "ph": "M", "pid": GPU_PID, "tid": 0,
+             "args": {"sort_index": 0}},
+            {"name": "process_name", "ph": "M", "pid": PYTHON_PID, "tid": 0,
+             "args": {"name": "Python Stack"}},
+            {"name": "process_sort_index", "ph": "M", "pid": PYTHON_PID, "tid": 0,
+             "args": {"sort_index": 2}},
+        ])
+        if cpu_pid is not None:
+            events.append(
+                {"name": "process_sort_index", "ph": "M", "pid": cpu_pid, "tid": 0,
+                 "args": {"sort_index": 1}},
+            )
+
+        trace_data["traceEvents"] = events
+        with open(trace_output, "w") as f:
+            json.dump(trace_data, f)
+
+        print(f"Chrome trace saved to {trace_output} (cleaned for Perfetto)")
+        print(f"Raw trace with stacks: {raw_trace}")
+        print(f"Open in chrome://tracing or https://ui.perfetto.dev")
+        print("\n" + prof_ctx.key_averages(group_by_stack_n=5).table(
+            sort_by="cuda_time_total" if is_cuda else "cpu_time_total",
+            row_limit=30,
+        ))
 
     times_t = torch.tensor(times)
     return {
@@ -220,6 +320,10 @@ def main():
     p_single.add_argument("--mode", type=str, default="both", choices=["forward", "both"])
     p_single.add_argument("--iter_output", type=str, default=None,
                           help="Path to save per-iteration times as CSV")
+    p_single.add_argument("--profile", action="store_true",
+                          help="Enable torch.profiler with Python stack traces")
+    p_single.add_argument("--trace_output", type=str, default="trace.json",
+                          help="Chrome trace output path (requires --profile)")
     _add_common_args(p_single)
 
     # --- sweep ---
@@ -243,6 +347,7 @@ def main():
             num_warmup=args.num_warmup,
             num_steps=args.num_steps,
             device=args.device,
+            trace_output=args.trace_output if args.profile else None,
         )
         for key in ["mean_s", "std_s", "min_s", "p50_s", "p95_s", "p99_s", "max_s"]:
             label = key.replace("_s", "").upper()
