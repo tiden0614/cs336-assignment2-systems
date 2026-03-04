@@ -43,6 +43,36 @@ class profile_range:
         return self._nvtx_decorator(self._rf_decorator(fn))
 
 
+def label_backward(model: torch.nn.Module):
+    """Register hooks that label each module's backward pass.
+
+    Adds record_function + NVTX ranges so backward passes show up as
+    e.g. "layers.0.attn [backward]" in both nsys and torch.profiler.
+    """
+    for name, module in model.named_modules():
+        if not name:
+            continue
+        label = f"{name} [backward]"
+
+        def make_hook(lbl):
+            def hook(mod, grad_input, grad_output):
+                pass  # post-hook, just for closing the range
+            def pre_hook(mod, grad_output):
+                mod._bwd_rf = record_function(lbl)
+                mod._bwd_rf.__enter__()
+                mod._bwd_nvtx = nvtx.range(lbl)
+                mod._bwd_nvtx.__enter__()
+            def post_hook(mod, grad_input, grad_output):
+                if hasattr(mod, "_bwd_rf"):
+                    mod._bwd_rf.__exit__(None, None, None)
+                if hasattr(mod, "_bwd_nvtx"):
+                    mod._bwd_nvtx.__exit__(None, None, None)
+            return pre_hook, post_hook
+        pre, post = make_hook(label)
+        module.register_full_backward_pre_hook(pre)
+        module.register_full_backward_hook(post)
+
+
 def softmax(x, dim=-1):
     rescaled_input = x - torch.max(x, dim=dim, keepdim=True)[0]
     exponentiated_rescaled_input = torch.exp(rescaled_input)

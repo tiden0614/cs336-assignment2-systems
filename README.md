@@ -63,3 +63,37 @@ To submit, run `./test_and_make_submission.sh` . This script will install your
 code's dependencies, run tests, and create a gzipped tarball with the output. We
 should be able to unzip your submitted tarball and run
 `./test_and_make_submission.sh` to verify your test results.
+
+## Profiling
+
+Both nsys profile and torch profiler
+```bash
+uv run nsys profile  \
+    --python-sampling=true  \
+    --python-backtrace=cuda  \
+    --sample=cpu  \
+    --cpuctxsw=process-tree  \
+    -o profile/trace1.nsys  \
+python -m cs336_systems.benchmark single  \
+    --model_size small \
+    --context_length 128 \
+    --device cuda:0  \
+    --num_warmup 10 \
+    --num_steps 3 \
+    --mode both \
+    --profile \
+    --trace_output profile/trace1.perfetto.json
+```
+
+Just the torch profiler
+```bash
+uv run python -m cs336_systems.benchmark single  \
+    --model_size small \
+    --context_length 128 \
+    --device cuda:0  \
+    --num_warmup 10 \
+    --num_steps 3 \
+    --mode both \
+    --profile \
+    --trace_output profile/trace1.perfetto.json
+```

@@ -44,3 +44,41 @@ Config: model=small, ctx=128, mode=both, warmup=10, steps=1000, device=cuda:0
    P99: 25.53 ms
    MAX: 67.52 ms
 ```
+
+## Problem 2: nsys_profile
+### (a)
+The time more than doubles. Now instead of 25ms, the mean becomes 64ms. The added profiling 
+functions add to the total runtime.
+
+### (b)
+On the forward path, self_attention takes the most time. A whole transformer block takes 2.823ms. The self_attention takes 2.349ms.
+
+* RMSNorm: 6
+* self_attention.qkv_proj: 3
+* self_attention.rope: 9
+* self_attention.casual_masking_construct: 2
+* self_attention.attention_score: 2
+* self_attention.casual_masking: 2
+* self_attention.attention_weights_computation: 5
+* self_attention.output_computation: 2
+* self_attention.output_reshaping: 1
+* self_attention.output_project: 1 memset + 1 kernel (44us)
+* swiglu: 3 memset + 6 kernels
+Total: 2 * RMSNorm + self_attention + swiglu = 45
+
+On the backward pass, attention still takes up the most time, but not as dramatic as in the forward pass. A whole backward pass take
+3.103ms, and the attention backward pass takes 1.619ms.
+
+### (c)
+Besides aten::bmm/aten::mul, in rms_norm, aten::mean takes 2.432us, aten::pow takes 1.249us
+In attention_core_computation, aten::div takes 1.760us. In causal_mask_construction, aten::ge takes 1.472us.
+
+### (d)
+With only forward:
+45.9ms.
+
+With both forward and backward:
+Forward pass takes 46ms. Backward pass takes 40ms.
+
+### (e)
+The total runtime is dominated not by any particular kernel, but by torch operations.

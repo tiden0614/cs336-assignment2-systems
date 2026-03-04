@@ -67,6 +67,7 @@ import timeit
 
 import torch
 from cs336_basics.model import BasicsTransformerLM
+from cs336_basics.nn_utils import label_backward
 
 MODEL_CONFIGS = {
     "small":  dict(d_model=768,  d_ff=3072,  num_layers=12, num_heads=12),
@@ -106,6 +107,8 @@ def benchmark(
 ) -> dict[str, float]:
     dev = torch.device(device)
     model = build_model(model_size, context_length, dev)
+    if trace_output is not None:
+        label_backward(model)
     x = make_batch(BATCH_SIZE, context_length, dev)
 
     is_cuda = dev.type == "cuda"
