@@ -97,3 +97,27 @@ uv run python -m cs336_systems.benchmark single  \
     --profile \
     --trace_output profile/trace1.perfetto.json
 ```
+
+```bash
+uv run python -m cs336_systems.benchmark sweep \
+    --model_sizes small medium large xl 2.7B  \
+    --context_lengths 128 256 512 1024 \
+    --device cuda:0 \
+    --num_warmup 10 \
+    --num_steps 3 \
+    --modes both \
+    --output profile/sweep.csv
+```
+
+
+```bash
+uv run python -m cs336_systems.benchmark sweep \
+    --model_sizes small medium large xl 2.7B  \
+    --context_lengths 128 256 512 1024 \
+    --device cuda:0 \
+    --num_warmup 10 \
+    --num_steps 3 \
+    --modes forward both \
+    --test_autocast false true \
+    --output profile/sweep.csv
+```

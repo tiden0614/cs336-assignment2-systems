@@ -104,6 +104,7 @@ def benchmark(
     num_steps: int,
     device: str,
     trace_output: str | None = None,
+    autocast: bool = False,
 ) -> dict[str, float]:
     dev = torch.device(device)
     model = build_model(model_size, context_length, dev)
@@ -114,13 +115,22 @@ def benchmark(
     is_cuda = dev.type == "cuda"
 
     def forward_step():
-        model(x)
+        if autocast:
+            with torch.autocast(device_type=dev.type, dtype=torch.bfloat16):
+                model(x)
+        else:
+            model(x)
         if is_cuda:
             torch.cuda.synchronize()
 
     def forward_backward_step():
-        logits = model(x)
-        loss = logits.sum()
+        if autocast:
+            with torch.autocast(device_type=dev.type, dtype=torch.bfloat16):
+                logits = model(x)
+                loss = logits.sum()
+        else:
+            logits = model(x)
+            loss = logits.sum()
         loss.backward()
         if is_cuda:
             torch.cuda.synchronize()
@@ -242,10 +252,14 @@ def sweep(
     num_steps: int,
     device: str,
     output: str | None = None,
+    test_autocast: list[bool] = [False],
 ) -> list[dict]:
     rows = []
-    for model_size, context_length, mode in itertools.product(model_sizes, context_lengths, modes):
-        label = f"model={model_size}, ctx={context_length}, mode={mode}"
+    for model_size, context_length, mode, autocast in itertools.product(
+        model_sizes, context_lengths, modes, test_autocast
+    ):
+        ac_label = "bf16" if autocast else "fp32"
+        label = f"model={model_size}, ctx={context_length}, mode={mode}, autocast={ac_label}"
         print(f"Running: {label} ...", flush=True)
         try:
             results = benchmark(
@@ -255,12 +269,13 @@ def sweep(
                 num_warmup=num_warmup,
                 num_steps=num_steps,
                 device=device,
+                autocast=autocast,
             )
-            nan = float("nan")
             row = {
                 "model_size": model_size,
                 "context_length": context_length,
                 "mode": mode,
+                "autocast": ac_label,
                 "mean_ms": results["mean_s"] * 1000,
                 "std_ms": results["std_s"] * 1000,
                 "min_ms": results["min_s"] * 1000,
@@ -277,6 +292,7 @@ def sweep(
                 "model_size": model_size,
                 "context_length": context_length,
                 "mode": mode,
+                "autocast": ac_label,
                 "mean_ms": nan, "std_ms": nan, "min_ms": nan,
                 "p50_ms": nan, "p95_ms": nan, "p99_ms": nan, "max_ms": nan,
             }
@@ -285,17 +301,17 @@ def sweep(
         rows.append(row)
 
     # Print summary table
-    header = (f"{'model':>8} {'ctx':>6} {'mode':>8} "
+    header = (f"{'model':>8} {'ctx':>6} {'mode':>8} {'cast':>6} "
               f"{'mean':>10} {'std':>10} {'min':>10} {'p50':>10} {'p95':>10} {'p99':>10} {'max':>10}")
     print("\n" + header)
     print("-" * len(header))
     for r in rows:
-        print(f"{r['model_size']:>8} {r['context_length']:>6} {r['mode']:>8} "
+        print(f"{r['model_size']:>8} {r['context_length']:>6} {r['mode']:>8} {r['autocast']:>6} "
               f"{r['mean_ms']:>10.2f} {r['std_ms']:>10.2f} {r['min_ms']:>10.2f} "
               f"{r['p50_ms']:>10.2f} {r['p95_ms']:>10.2f} {r['p99_ms']:>10.2f} {r['max_ms']:>10.2f}")
 
     if output:
-        fieldnames = ["model_size", "context_length", "mode",
+        fieldnames = ["model_size", "context_length", "mode", "autocast",
                       "mean_ms", "std_ms", "min_ms", "p50_ms", "p95_ms", "p99_ms", "max_ms"]
         with open(output, "w", newline="") as f:
             writer = csv.DictWriter(f, fieldnames=fieldnames)
@@ -336,6 +352,9 @@ def main():
     p_sweep.add_argument("--context_lengths", nargs="+", type=int, default=[128, 256, 512, 1024])
     p_sweep.add_argument("--modes", nargs="+", default=["forward", "both"], choices=["forward", "both"])
     p_sweep.add_argument("--output", type=str, default=None, help="Path to save CSV results")
+    p_sweep.add_argument("--test_autocast", nargs="+", type=str, default=["false"],
+                         choices=["true", "false"],
+                         help="Sweep autocast on/off (default: false only)")
     _add_common_args(p_sweep)
 
     args = parser.parse_args()
@@ -373,6 +392,7 @@ def main():
             num_steps=args.num_steps,
             device=args.device,
             output=args.output,
+            test_autocast=[s == "true" for s in args.test_autocast],
         )
 
 
