@@ -14,6 +14,8 @@ CLI args (single):
     --iter_output    Path to save per-iteration times as CSV (optional, single only)
     --profile        Enable torch.profiler with Python stack traces
     --trace_output   Chrome trace output path (default: trace.json, requires --profile)
+    --profile_memory Path to save memory snapshot pickle (for pytorch.org/memory_viz)
+    --autocast       Enable BF16 autocast
 
 CLI args (sweep):
     --model_sizes       Space-separated list (default: all)
@@ -65,9 +67,11 @@ import itertools
 import json
 import timeit
 
+import math
+
 import torch
 from cs336_basics.model import BasicsTransformerLM
-from cs336_basics.nn_utils import label_backward
+from cs336_basics.nn_utils import label_backward, profile_range, softmax
 
 MODEL_CONFIGS = {
     "small":  dict(d_model=768,  d_ff=3072,  num_layers=12, num_heads=12),
@@ -105,6 +109,7 @@ def benchmark(
     device: str,
     trace_output: str | None = None,
     autocast: bool = False,
+    profile_memory: str | None = None,
 ) -> dict[str, float]:
     dev = torch.device(device)
     model = build_model(model_size, context_length, dev)
@@ -141,6 +146,10 @@ def benchmark(
     for _ in range(num_warmup):
         step_fn()
         model.zero_grad(set_to_none=True)
+
+    # Memory profiling — start recording after warmup
+    if profile_memory and is_cuda:
+        torch.cuda.memory._record_memory_history(max_entries=1000000)
 
     # Measure
     profiling = trace_output is not None
@@ -230,6 +239,13 @@ def benchmark(
             sort_by="cuda_time_total" if is_cuda else "cpu_time_total",
             row_limit=30,
         ))
+
+    # Memory profiling — dump snapshot and stop recording
+    if profile_memory and is_cuda:
+        torch.cuda.memory._dump_snapshot(profile_memory)
+        torch.cuda.memory._record_memory_history(enabled=None)
+        print(f"Memory snapshot saved to {profile_memory}")
+        print(f"Open at https://pytorch.org/memory_viz")
 
     times_t = torch.tensor(times)
     return {
@@ -322,6 +338,172 @@ def sweep(
     return rows
 
 
+@profile_range("vanilla_attention")
+def vanilla_attention(Q, K, V):
+    """Scaled dot-product attention without multihead, no causal mask."""
+    d_k = K.shape[-1]
+    with profile_range("attention_scores"):
+        # autograd saves Q, K
+        scores = torch.bmm(Q, K.transpose(-2, -1)) / math.sqrt(d_k)
+    with profile_range("attention_softmax"):
+        # autograd saves weights -- the output of the softmax op
+        weights = torch.softmax(scores, dim=-1)
+    with profile_range("attention_output"):
+        # autograd saves weights, V. Since weights is already saved
+        # by the last step, autograd will reuse it
+        return torch.bmm(weights, V)
+
+
+def benchmark_attention(
+    d_heads: list[int],
+    seq_lens: list[int],
+    num_warmup: int,
+    num_steps: int,
+    device: str,
+    output: str | None = None,
+    profile_memory: str | None = None,
+) -> list[dict]:
+    """Benchmark attention at various (d_head, seq_len) configurations.
+
+    Per the assignment: batch_size=8, single head, no causal mask.
+    Times 100 forward passes, measures memory, then times 100 backward passes.
+    """
+    BATCH_SIZE_ATTN = 8
+    dev = torch.device(device)
+    is_cuda = dev.type == "cuda"
+    timer = timeit.default_timer
+    rows = []
+
+    for d_head, seq_len in itertools.product(d_heads, seq_lens):
+        label = f"d_head={d_head}, seq_len={seq_len}"
+        print(f"Running: {label} ...", flush=True)
+
+        try:
+            Q = torch.randn(BATCH_SIZE_ATTN, seq_len, d_head, device=dev, requires_grad=True)
+            K = torch.randn(BATCH_SIZE_ATTN, seq_len, d_head, device=dev, requires_grad=True)
+            V = torch.randn(BATCH_SIZE_ATTN, seq_len, d_head, device=dev, requires_grad=True)
+
+            # Warmup forward
+            for _ in range(num_warmup):
+                out = vanilla_attention(Q, K, V)
+                if is_cuda:
+                    torch.cuda.synchronize()
+                out.detach_()
+
+            # Memory profiling on backward
+            if profile_memory and is_cuda:
+                torch.cuda.memory._record_memory_history(max_entries=1000000)
+
+            # Time forward passes
+            fwd_times = []
+            for _ in range(num_steps):
+                start = timer()
+                out = vanilla_attention(Q, K, V)
+                if is_cuda:
+                    torch.cuda.synchronize()
+                elapsed = timer() - start
+                fwd_times.append(elapsed)
+                out.detach_()
+
+            # Run one forward to get a live output for backward timing
+            out = vanilla_attention(Q, K, V)
+            loss = out.sum()
+
+            # Measure memory after forward (includes autograd-saved scores/weights)
+            peak_mem_mb = 0.0
+            if is_cuda:
+                torch.cuda.synchronize()
+                peak_mem_mb = torch.cuda.memory_allocated(dev) / (1024 ** 2)  # MB
+
+            # Warmup backward
+            for _ in range(num_warmup):
+                loss.backward(retain_graph=True)
+                if is_cuda:
+                    torch.cuda.synchronize()
+                Q.grad = K.grad = V.grad = None
+
+            # Reset peak memory tracker before backward timing
+            if is_cuda:
+                torch.cuda.reset_peak_memory_stats(dev)
+
+            # Time backward passes
+            bwd_times = []
+            for _ in range(num_steps):
+                start = timer()
+                loss.backward(retain_graph=True)
+                if is_cuda:
+                    torch.cuda.synchronize()
+                elapsed = timer() - start
+                bwd_times.append(elapsed)
+                Q.grad = K.grad = V.grad = None
+
+            if profile_memory and is_cuda:
+                mem_path = f"{profile_memory}_d{d_head}_s{seq_len}.pickle"
+                torch.cuda.memory._dump_snapshot(mem_path)
+                torch.cuda.memory._record_memory_history(enabled=None)
+                print(f"  Memory snapshot: {mem_path}")
+
+            # Peak memory during backward (high-water mark)
+            mem_peak_bwd_mb = 0.0
+            if is_cuda:
+                torch.cuda.synchronize()
+                mem_peak_bwd_mb = torch.cuda.max_memory_allocated(dev) / (1024 ** 2)
+
+            fwd_t = torch.tensor(fwd_times)
+            bwd_t = torch.tensor(bwd_times)
+            row = {
+                "d_head": d_head,
+                "seq_len": seq_len,
+                "fwd_mean_ms": fwd_t.mean().item() * 1000,
+                "fwd_std_ms": fwd_t.std().item() * 1000,
+                "bwd_mean_ms": bwd_t.mean().item() * 1000,
+                "bwd_std_ms": bwd_t.std().item() * 1000,
+                "mem_after_fwd_mb": peak_mem_mb,
+                "mem_peak_bwd_mb": mem_peak_bwd_mb,
+            }
+            print(f"  => fwd_mean={row['fwd_mean_ms']:.2f}ms  bwd_mean={row['bwd_mean_ms']:.2f}ms  "
+                  f"mem_fwd={row['mem_after_fwd_mb']:.1f}MB  peak_bwd={row['mem_peak_bwd_mb']:.1f}MB")
+
+        except torch.OutOfMemoryError:
+            nan = float("nan")
+            row = {
+                "d_head": d_head,
+                "seq_len": seq_len,
+                "fwd_mean_ms": nan, "fwd_std_ms": nan,
+                "bwd_mean_ms": nan, "bwd_std_ms": nan,
+                "mem_after_fwd_mb": nan, "mem_peak_bwd_mb": nan,
+            }
+            print("  => OOM")
+            torch.cuda.empty_cache()
+
+        rows.append(row)
+
+        # Free tensors between configs to avoid OOM cascade
+        Q = K = V = out = loss = None  # type: ignore[possibly-undefined]
+        if is_cuda:
+            torch.cuda.empty_cache()
+
+    # Print summary table
+    header = (f"{'d_head':>6} {'seq_len':>8} {'fwd_mean':>10} {'fwd_std':>10} "
+              f"{'bwd_mean':>10} {'bwd_std':>10} {'mem_fwd':>10} {'peak_bwd':>10}")
+    print("\n" + header)
+    print("-" * len(header))
+    for r in rows:
+        print(f"{r['d_head']:>6} {r['seq_len']:>8} {r['fwd_mean_ms']:>10.2f} {r['fwd_std_ms']:>10.2f} "
+              f"{r['bwd_mean_ms']:>10.2f} {r['bwd_std_ms']:>10.2f} "
+              f"{r['mem_after_fwd_mb']:>10.1f} {r['mem_peak_bwd_mb']:>10.1f}")
+
+    if output:
+        fieldnames = list(rows[0].keys())
+        with open(output, "w", newline="") as f:
+            writer = csv.DictWriter(f, fieldnames=fieldnames)
+            writer.writeheader()
+            writer.writerows(rows)
+        print(f"\nResults saved to {output}")
+
+    return rows
+
+
 def _add_common_args(parser: argparse.ArgumentParser):
     parser.add_argument("--num_warmup", type=int, default=5)
     parser.add_argument("--num_steps", type=int, default=10)
@@ -343,6 +525,10 @@ def main():
                           help="Enable torch.profiler with Python stack traces")
     p_single.add_argument("--trace_output", type=str, default="trace.json",
                           help="Chrome trace output path (requires --profile)")
+    p_single.add_argument("--profile_memory", type=str, default=None,
+                          help="Path to save memory snapshot pickle (for pytorch.org/memory_viz)")
+    p_single.add_argument("--autocast", action="store_true",
+                          help="Enable BF16 autocast")
     _add_common_args(p_single)
 
     # --- sweep ---
@@ -357,6 +543,15 @@ def main():
                          help="Sweep autocast on/off (default: false only)")
     _add_common_args(p_sweep)
 
+    # --- attention ---
+    p_attn = sub.add_parser("attention", help="Benchmark vanilla attention at various scales")
+    p_attn.add_argument("--d_heads", nargs="+", type=int, default=[16, 32, 64, 128])
+    p_attn.add_argument("--seq_lens", nargs="+", type=int, default=[256, 1024, 4096, 8192, 16384])
+    p_attn.add_argument("--output", type=str, default=None, help="Path to save CSV results")
+    p_attn.add_argument("--profile_memory", type=str, default=None,
+                         help="Path prefix for memory snapshots")
+    _add_common_args(p_attn)
+
     args = parser.parse_args()
 
     if args.command == "single":
@@ -370,6 +565,8 @@ def main():
             num_steps=args.num_steps,
             device=args.device,
             trace_output=args.trace_output if args.profile else None,
+            autocast=args.autocast,
+            profile_memory=args.profile_memory,
         )
         for key in ["mean_s", "std_s", "min_s", "p50_s", "p95_s", "p99_s", "max_s"]:
             label = key.replace("_s", "").upper()
@@ -393,6 +590,17 @@ def main():
             device=args.device,
             output=args.output,
             test_autocast=[s == "true" for s in args.test_autocast],
+        )
+
+    elif args.command == "attention":
+        benchmark_attention(
+            d_heads=args.d_heads,
+            seq_lens=args.seq_lens,
+            num_warmup=args.num_warmup,
+            num_steps=args.num_steps,
+            device=args.device,
+            output=args.output,
+            profile_memory=args.profile_memory,
         )
 
 

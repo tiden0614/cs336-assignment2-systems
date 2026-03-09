@@ -120,4 +120,51 @@ uv run python -m cs336_systems.benchmark sweep \
     --modes forward both \
     --test_autocast false true \
     --output profile/sweep.csv
+
+# Memory profile of 2.7B model, forward only
+uv run python -m cs336_systems.benchmark single \
+    --model_size 2.7B --context_length 128 --mode forward \
+    --num_warmup 5 --num_steps 1 --device cuda:0 \
+    --profile_memory profile/mem_2.7B_fwd_128.pickle
+
+uv run python -m cs336_systems.benchmark single \
+    --model_size 2.7B --context_length 128 --mode forward \
+    --num_warmup 5 --num_steps 1 --device cuda:0 \
+    --autocast --profile_memory profile/mem_2.7B_fwd_128_bf16.pickle
+
+# Memory profile of 2.7B model, full training step
+uv run python -m cs336_systems.benchmark single \
+    --model_size 2.7B --context_length 128 --mode both \
+    --num_warmup 5 --num_steps 1 --device cuda:0 \
+    --profile_memory profile/mem_2.7B_both_128.pickle
+
+# With mixed precision
+uv run python -m cs336_systems.benchmark single \
+    --model_size 2.7B --context_length 128 --mode both \
+    --num_warmup 5 --num_steps 1 --device cuda:0 \
+    --autocast --profile_memory profile/mem_2.7B_both_128_bf16.pickle
+
+# ctx=256 fwd
+uv run python -m cs336_systems.benchmark single \
+    --model_size 2.7B --context_length 256 --mode forward \
+    --num_warmup 5 --num_steps 1 --device cuda:0 \
+    --profile_memory profile/mem_2.7B_fwd_256.pickle
+
+# ctx=256 fwd mixed_precision
+uv run python -m cs336_systems.benchmark single \
+    --model_size 2.7B --context_length 256 --mode forward \
+    --num_warmup 5 --num_steps 1 --device cuda:0 \
+    --profile_memory profile/mem_2.7B_fwd_256_bf16.pickle
+
+# ctx=256 fwd+back
+uv run python -m cs336_systems.benchmark single \
+    --model_size 2.7B --context_length 256 --mode both \
+    --num_warmup 5 --num_steps 1 --device cuda:0 \
+    --profile_memory profile/mem_2.7B_both_256.pickle
+
+# ctx=256 fwd+back mixed_precision
+uv run python -m cs336_systems.benchmark single \
+    --model_size 2.7B --context_length 256 --mode both \
+    --num_warmup 5 --num_steps 1 --device cuda:0 \
+    --autocast --profile_memory profile/mem_2.7B_both_256_bf16.pickle
 ```

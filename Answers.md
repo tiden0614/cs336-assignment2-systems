@@ -248,3 +248,98 @@ For 2.7B, ctx=128
     2.7B   1024     both   fp32        nan        nan        nan        nan        nan        nan        nan
     2.7B   1024     both   bf16        nan        nan        nan        nan        nan        nan        nan
 ------------------------------------------------------------------------------------------------------------
+
+## Problem 5: memory_profiling
+### (a)
+On the forward path, the memory time looks like a pyramid. Probably allocation of earlier steps are held
+in memory for longer (spaning the whole step) and later steps shorter (allocated and released). The backwards
+phase also looks like a pyramid, but probably reversed -- later step allocations are held in memory for longer
+and earlier steps shorter.
+
+### (b)
+
+|     | Fwd  | Both |
+|-----|------|------|
+| 128 | 17.9 | 25.4 |
+| 256 | 24.2 | 25.5 |
+Unit in GB.
+
+### (c)
+
+| fwd+back | fp32 | mixed |
+|----------|------|-------|
+| 128      | 25.4 | 25.4  |
+| 256      | 25.4 | 25.5  |
+Unit in GB.
+
+Mixed precision doesn't seem to affect peak memory utilization.
+
+### (d)
+I assume "single precision" here means using fp32 only. 
+
+---
+When ctx_len=128, allocations sizes are 5MB, 8MB or 20MB.
+
+batch * seq * d_model * fp32 -> 
+4 * 128 * 2560 * 4 / 2^20 = 5MB
+
+---
+When ctx_len=256, allocations sizes are 10MB, 32MB or 40MB.
+
+batch * seq * d_model * fp32 -> 
+4 * 256 * 2560 * 4 / 2^20 = 10MB
+
+### (e)
+Ctx=128, the largest allocations in activation are of size 20MB. This probably came
+from FFN layer (batch, seq, d_ff) -> 4 * 128 * 10240 * 4 / 2^20 = 20MB
+
+The static allocations are of size 25MB and 100MB. 
+d_model*d_model -> 2560*2560*4/2^20 = 25MB
+d_ff * d_model -> 2560*10240*4/2^20 = 100MB
+
+So my guess is that these static allocations are weights in various layers that scale
+with d_model or d_ff.
+
+## Problem 6: pytorch_attention
+### (a)
+d_head  seq_len   fwd_mean    fwd_std   bwd_mean    bwd_std    mem_fwd   peak_bwd
+---------------------------------------------------------------------------------
+    16      256       0.08       0.01       0.09       0.01       10.6       24.9
+    16     1024       0.11       0.00       0.21       0.00       50.3      146.8
+    16     4096       2.29       0.01       4.46       0.02      536.3     2074.3
+    16     8192       8.78       0.01      17.19       0.03     2080.3     8228.3
+    16    16384        nan        nan        nan        nan        nan        nan
+    32      256       0.08       0.01       0.09       0.02       19.3       25.5
+    32     1024       0.12       0.00       0.24       0.05       52.3      149.3
+    32     4096       2.34       0.00       4.53       0.02      544.3     2084.3
+    32     8192       9.03       0.01      17.43       0.02     2096.3     8248.3
+    32    16384        nan        nan        nan        nan        nan        nan
+    64      256       0.08       0.00       0.09       0.01       20.3       26.8
+    64     1024       0.13       0.00       0.25       0.04       56.3      154.3
+    64     4096       2.51       0.01       4.88       0.02      560.3     2104.3
+    64     8192       9.70       0.01      18.43       0.05     2128.3     8288.3
+    64    16384        nan        nan        nan        nan        nan        nan
+   128      256       0.08       0.01       0.09       0.02       22.3       29.3
+   128     1024       0.20       0.01       0.39       0.03       64.3      164.3
+   128     4096       3.47       0.01       6.63       0.03      592.3     2144.3
+   128     8192      13.66       0.04      25.30       0.07     2192.3     8368.3
+   128    16384        nan        nan        nan        nan        nan        nan
+
+Analyzing the configuration before the first OOM: d_head=16 seq_len=8192
+Q*K -> batch_size * seq_len * seq_len -> 8*8192*8192*4/2^30 = 2GB
+W_Q = W_K = W_V = d_head * d_head -> 16*16*4 = 1024 bytes
+Q = K = V -> batch_size * seq_len * d_head -> 8*8192*16*4/2^20 = 4MB
+
+Analyzing the first OOM configuration: d_head=16 seq_len=16384.
+Q*K -> batch_size * seq_len * seq_len -> 8*16384*16384*4/2^30 = 8GB
+W_Q = W_K = W_V = d_head * d_head -> 16*16*4 = 1024 bytes
+Q = K = V -> batch_size * seq_len * d_head -> 8*16384*16*4/2^20 = 8MB
+
+Why OOM?
+For seq_len=16384, at peak allocation (happens at the backward pass), 
+4 * 8GB allocations exist at the same time:
+1. the output of the softmax operation, saved by autograd in forward
+2. dP = d(softmax), intermediate gradient during backward
+3. elementwise operation (ln) of shape (batch, seq, seq), computed in
+   the backwards step of softmax. intermediate result
+4. dS = output of softmax_backward
