@@ -343,3 +343,86 @@ For seq_len=16384, at peak allocation (happens at the backward pass),
 3. elementwise operation (ln) of shape (batch, seq, seq), computed in
    the backwards step of softmax. intermediate result
 4. dS = output of softmax_backward
+
+## Problem 7: torch_compile
+### (a)
+     compile d_head  seq_len   fwd_mean    fwd_std   bwd_mean    bwd_std    mem_fwd   peak_bwd
+----------------------------------------------------------------------------------------------
+        none     16      256       0.07       0.00       0.08       0.01       10.6       24.9
+        none     16     8192       8.81       0.03      17.21       0.04     2080.3     8228.3
+        none     16    12288      20.57       0.02      39.33       0.06     4648.3    18478.3
+        none    128      256       0.07       0.00       0.09       0.01       22.3       29.3
+        none    128     8192      13.65       0.04      25.32       0.07     2192.3     8368.3
+        none    128    12288      30.98       0.06      57.46       0.22     4816.3    18688.3
+     default     16      256       0.11       0.01       0.08       0.00       18.8       24.9
+     default     16     8192       8.84       0.02      17.25       0.06     2080.3     8228.3
+     default     16    12288      20.63       0.05      39.36       0.05     4648.3    18478.3
+     default    128      256       0.14       0.00       0.09       0.03       22.3       29.3
+     default    128     8192      13.76       0.05      25.41       0.07     2192.3     8368.3
+     default    128    12288      31.20       0.07      57.67       0.16     4816.3    18688.3
+
+The compilation doesn't seem to be effective for either latency or memory util. I think the
+reason is that the operation is already mem bandwidth bound and the compilation doesn't help
+further; I would expect the compilation to be effective on the actual model code when the load
+is small -- hence the latency is dominated by torch scheduling kernels.
+
+### (b)
+   model    ctx     mode   cast          compile       mean        std        min        p50        p95        p99        max
+-----------------------------------------------------------------------------------------------------------------------------
+   small    128  forward   fp32             none      17.21       0.36      16.94      17.08      18.12      18.54      18.68
+   small    128  forward   fp32          default      20.22       0.47      19.86      20.05      21.13      21.79      22.91
+   small    256  forward   fp32             none      17.87       0.47      17.53      17.68      19.13      19.80      19.83
+   small    256  forward   fp32          default      23.04       0.51      22.69      22.86      24.04      25.20      25.48
+   small    512  forward   fp32             none      18.54       0.49      18.14      18.30      19.62      20.14      20.18
+   small    512  forward   fp32          default      24.13       0.80      23.47      23.73      25.90      26.43      26.69
+   small   1024  forward   fp32             none      48.99       0.14      48.79      48.96      49.34      49.43      49.51
+   small   1024  forward   fp32          default      37.51       0.12      37.28      37.49      37.76      38.02      38.02
+   large    128  forward   fp32             none      52.33      10.09      50.23      50.99      54.61      55.97     151.63
+   large    128  forward   fp32          default      67.26      12.71      65.09      65.57      68.81      71.04     192.58
+   large    256  forward   fp32             none      54.17       0.30      53.84      54.11      54.41      55.42      55.92
+   large    256  forward   fp32          default      68.80      12.78      66.50      66.99      71.33      74.33     194.64
+   large    512  forward   fp32             none     115.80       0.19     115.40     115.81     116.05     116.26     116.35
+   large    512  forward   fp32          default     100.96       0.20     100.68     100.93     101.46     101.62     101.77
+   large   1024  forward   fp32             none        nan        nan        nan        nan        nan        nan        nan
+   large   1024  forward   fp32          default        nan        nan        nan        nan        nan        nan        nan
+      xl    128  forward   fp32             none      71.63       1.29      70.40      71.19      74.36      76.17      77.06
+      xl    128  forward   fp32          default      92.81      15.06      89.52      90.81      95.42     100.83     240.92
+      xl    256  forward   fp32             none     104.71       0.17     104.35     104.70     104.97     105.14     105.17
+      xl    256  forward   fp32          default      97.57      14.54      93.56      95.98      98.04     102.04     241.21
+      xl    512  forward   fp32             none        nan        nan        nan        nan        nan        nan        nan
+      xl    512  forward   fp32          default        nan        nan        nan        nan        nan        nan        nan
+      xl   1024  forward   fp32             none        nan        nan        nan        nan        nan        nan        nan
+      xl   1024  forward   fp32          default        nan        nan        nan        nan        nan        nan        nan
+
+For forward, compilation=default causes latency regression for smaller ctx and latency gain for larger ctx. It also starts causes
+high variance for latency on xl model.
+
+   model    ctx     mode   cast          compile       mean        std        min        p50        p95        p99        max
+-----------------------------------------------------------------------------------------------------------------------------
+   small    128     both   fp32             none      31.47       2.19      28.12      31.25      34.67      36.52      44.99
+   small    128     both   fp32          default      28.44       0.80      27.84      28.10      30.34      31.02      31.56
+   small    256     both   fp32             none      34.58       0.56      34.15      34.31      35.92      36.23      36.24
+   small    256     both   fp32          default      37.69      10.51      35.07      35.99      39.56      42.03     140.76
+   small    512     both   fp32             none      52.84       1.08      51.69      52.39      54.81      55.31      55.99
+   small    512     both   fp32          default      51.26       1.82      49.12      50.40      54.14      55.32      55.89
+   small   1024     both   fp32             none     145.04       0.32     144.40     145.05     145.53     145.67     145.96
+   small   1024     both   fp32          default     103.65       9.90     100.89     102.57     103.35     104.61     201.55
+   large    128     both   fp32             none     115.10       2.89     111.14     114.38     119.82     122.53     123.86
+   large    128     both   fp32          default     120.21      12.36     117.37     118.52     122.53     128.09     241.59
+   large    256     both   fp32             none     156.71       0.37     155.84     156.75     157.21     157.47     157.48
+   large    256     both   fp32          default     155.02      12.25     152.20     153.34     158.95     161.41     275.17
+   large    512     both   fp32             none     341.72       0.65     339.81     341.81     342.53     342.89     342.89
+   large    512     both   fp32          default     288.33       8.72     284.75     287.54     288.04     293.43     374.33
+   large   1024     both   fp32             none        nan        nan        nan        nan        nan        nan        nan
+   large   1024     both   fp32          default        nan        nan        nan        nan        nan        nan        nan
+      xl    128     both   fp32             none     183.89       1.95     181.57     183.21     187.63     189.84     190.59
+      xl    128     both   fp32          default     225.66      19.08     220.99     222.05     228.76     355.33     359.97
+      xl    256     both   fp32             none     312.06       0.75     310.03     312.26     312.96     313.08     313.12
+      xl    256     both   fp32          default     308.52      22.30     301.67     303.72     315.40     432.90     436.01
+      xl    512     both   fp32             none        nan        nan        nan        nan        nan        nan        nan
+      xl    512     both   fp32          default     587.74       8.51     581.42     587.49     588.65     638.12     651.72
+      xl   1024     both   fp32             none        nan        nan        nan        nan        nan        nan        nan
+      xl   1024     both   fp32          default        nan        nan        nan        nan        nan        nan        nan
+
+The effect of compilation increases now that we add backward pass into the picture. Latency regression overall is reduced for
+smaller ctx and latency gain starts at earlier ctx. The compilation is also able to avoid OOM for xl model where ctx=512.

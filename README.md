@@ -167,4 +167,17 @@ uv run python -m cs336_systems.benchmark single \
     --model_size 2.7B --context_length 256 --mode both \
     --num_warmup 5 --num_steps 1 --device cuda:0 \
     --autocast --profile_memory profile/mem_2.7B_both_256_bf16.pickle
+
+
+
+uv run python -m cs336_systems.benchmark sweep \
+    --model_sizes small xl \
+    --context_lengths 128 256 512 1024 \
+    --device cuda:0 \
+    --num_warmup 10 \
+    --num_steps 100 \
+    --modes forward \
+    --test_autocast false \
+    --compile none default \
+    --output profile/sweep.csv
 ```

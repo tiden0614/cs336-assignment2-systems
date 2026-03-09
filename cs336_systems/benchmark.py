@@ -110,9 +110,12 @@ def benchmark(
     trace_output: str | None = None,
     autocast: bool = False,
     profile_memory: str | None = None,
+    compile_mode: str = "none",
 ) -> dict[str, float]:
     dev = torch.device(device)
     model = build_model(model_size, context_length, dev)
+    if compile_mode != "none":
+        model = torch.compile(model, mode=compile_mode)
     if trace_output is not None:
         label_backward(model)
     x = make_batch(BATCH_SIZE, context_length, dev)
@@ -142,8 +145,9 @@ def benchmark(
 
     step_fn = forward_step if mode == "forward" else forward_backward_step
 
-    # Warmup
-    for _ in range(num_warmup):
+    # Warmup (extra iters for compile to finish tracing)
+    warmup_iters = num_warmup if compile_mode == "none" else max(num_warmup, 10)
+    for _ in range(warmup_iters):
         step_fn()
         model.zero_grad(set_to_none=True)
 
@@ -269,13 +273,14 @@ def sweep(
     device: str,
     output: str | None = None,
     test_autocast: list[bool] = [False],
+    compile_modes: list[str] = ["none"],
 ) -> list[dict]:
     rows = []
-    for model_size, context_length, mode, autocast in itertools.product(
-        model_sizes, context_lengths, modes, test_autocast
+    for model_size, context_length, mode, autocast, compile_mode in itertools.product(
+        model_sizes, context_lengths, modes, test_autocast, compile_modes
     ):
         ac_label = "bf16" if autocast else "fp32"
-        label = f"model={model_size}, ctx={context_length}, mode={mode}, autocast={ac_label}"
+        label = f"model={model_size}, ctx={context_length}, mode={mode}, autocast={ac_label}, compile={compile_mode}"
         print(f"Running: {label} ...", flush=True)
         try:
             results = benchmark(
@@ -286,12 +291,14 @@ def sweep(
                 num_steps=num_steps,
                 device=device,
                 autocast=autocast,
+                compile_mode=compile_mode,
             )
             row = {
                 "model_size": model_size,
                 "context_length": context_length,
                 "mode": mode,
                 "autocast": ac_label,
+                "compile": compile_mode,
                 "mean_ms": results["mean_s"] * 1000,
                 "std_ms": results["std_s"] * 1000,
                 "min_ms": results["min_s"] * 1000,
@@ -309,6 +316,7 @@ def sweep(
                 "context_length": context_length,
                 "mode": mode,
                 "autocast": ac_label,
+                "compile": compile_mode,
                 "mean_ms": nan, "std_ms": nan, "min_ms": nan,
                 "p50_ms": nan, "p95_ms": nan, "p99_ms": nan, "max_ms": nan,
             }
@@ -317,17 +325,17 @@ def sweep(
         rows.append(row)
 
     # Print summary table
-    header = (f"{'model':>8} {'ctx':>6} {'mode':>8} {'cast':>6} "
+    header = (f"{'model':>8} {'ctx':>6} {'mode':>8} {'cast':>6} {'compile':>16} "
               f"{'mean':>10} {'std':>10} {'min':>10} {'p50':>10} {'p95':>10} {'p99':>10} {'max':>10}")
     print("\n" + header)
     print("-" * len(header))
     for r in rows:
-        print(f"{r['model_size']:>8} {r['context_length']:>6} {r['mode']:>8} {r['autocast']:>6} "
+        print(f"{r['model_size']:>8} {r['context_length']:>6} {r['mode']:>8} {r['autocast']:>6} {r['compile']:>16} "
               f"{r['mean_ms']:>10.2f} {r['std_ms']:>10.2f} {r['min_ms']:>10.2f} "
               f"{r['p50_ms']:>10.2f} {r['p95_ms']:>10.2f} {r['p99_ms']:>10.2f} {r['max_ms']:>10.2f}")
 
     if output:
-        fieldnames = ["model_size", "context_length", "mode", "autocast",
+        fieldnames = ["model_size", "context_length", "mode", "autocast", "compile",
                       "mean_ms", "std_ms", "min_ms", "p50_ms", "p95_ms", "p99_ms", "max_ms"]
         with open(output, "w", newline="") as f:
             writer = csv.DictWriter(f, fieldnames=fieldnames)
@@ -362,6 +370,7 @@ def benchmark_attention(
     device: str,
     output: str | None = None,
     profile_memory: str | None = None,
+    compile_modes: list[str] = ["none"],
 ) -> list[dict]:
     """Benchmark attention at various (d_head, seq_len) configurations.
 
@@ -374,8 +383,14 @@ def benchmark_attention(
     timer = timeit.default_timer
     rows = []
 
-    for d_head, seq_len in itertools.product(d_heads, seq_lens):
-        label = f"d_head={d_head}, seq_len={seq_len}"
+    for compile_mode, d_head, seq_len in itertools.product(compile_modes, d_heads, seq_lens):
+        # Select attention function
+        if compile_mode == "none":
+            attn_fn = vanilla_attention
+        else:
+            attn_fn = torch.compile(vanilla_attention, mode=compile_mode)
+
+        label = f"compile={compile_mode}, d_head={d_head}, seq_len={seq_len}"
         print(f"Running: {label} ...", flush=True)
 
         try:
@@ -383,9 +398,10 @@ def benchmark_attention(
             K = torch.randn(BATCH_SIZE_ATTN, seq_len, d_head, device=dev, requires_grad=True)
             V = torch.randn(BATCH_SIZE_ATTN, seq_len, d_head, device=dev, requires_grad=True)
 
-            # Warmup forward
-            for _ in range(num_warmup):
-                out = vanilla_attention(Q, K, V)
+            # Warmup forward (extra warmup for compile to finish tracing)
+            warmup_iters = num_warmup if compile_mode == "none" else max(num_warmup, 10)
+            for _ in range(warmup_iters):
+                out = attn_fn(Q, K, V)
                 if is_cuda:
                     torch.cuda.synchronize()
                 out.detach_()
@@ -398,7 +414,7 @@ def benchmark_attention(
             fwd_times = []
             for _ in range(num_steps):
                 start = timer()
-                out = vanilla_attention(Q, K, V)
+                out = attn_fn(Q, K, V)
                 if is_cuda:
                     torch.cuda.synchronize()
                 elapsed = timer() - start
@@ -406,7 +422,7 @@ def benchmark_attention(
                 out.detach_()
 
             # Run one forward to get a live output for backward timing
-            out = vanilla_attention(Q, K, V)
+            out = attn_fn(Q, K, V)
             loss = out.sum()
 
             # Measure memory after forward (includes autograd-saved scores/weights)
@@ -452,6 +468,7 @@ def benchmark_attention(
             fwd_t = torch.tensor(fwd_times)
             bwd_t = torch.tensor(bwd_times)
             row = {
+                "compile": compile_mode,
                 "d_head": d_head,
                 "seq_len": seq_len,
                 "fwd_mean_ms": fwd_t.mean().item() * 1000,
@@ -467,6 +484,7 @@ def benchmark_attention(
         except torch.OutOfMemoryError:
             nan = float("nan")
             row = {
+                "compile": compile_mode,
                 "d_head": d_head,
                 "seq_len": seq_len,
                 "fwd_mean_ms": nan, "fwd_std_ms": nan,
@@ -484,12 +502,13 @@ def benchmark_attention(
             torch.cuda.empty_cache()
 
     # Print summary table
-    header = (f"{'d_head':>6} {'seq_len':>8} {'fwd_mean':>10} {'fwd_std':>10} "
+    header = (f"{'compile':>12} {'d_head':>6} {'seq_len':>8} {'fwd_mean':>10} {'fwd_std':>10} "
               f"{'bwd_mean':>10} {'bwd_std':>10} {'mem_fwd':>10} {'peak_bwd':>10}")
     print("\n" + header)
     print("-" * len(header))
     for r in rows:
-        print(f"{r['d_head']:>6} {r['seq_len']:>8} {r['fwd_mean_ms']:>10.2f} {r['fwd_std_ms']:>10.2f} "
+        print(f"{r['compile']:>12} {r['d_head']:>6} {r['seq_len']:>8} "
+              f"{r['fwd_mean_ms']:>10.2f} {r['fwd_std_ms']:>10.2f} "
               f"{r['bwd_mean_ms']:>10.2f} {r['bwd_std_ms']:>10.2f} "
               f"{r['mem_after_fwd_mb']:>10.1f} {r['mem_peak_bwd_mb']:>10.1f}")
 
@@ -541,6 +560,9 @@ def main():
     p_sweep.add_argument("--test_autocast", nargs="+", type=str, default=["false"],
                          choices=["true", "false"],
                          help="Sweep autocast on/off (default: false only)")
+    p_sweep.add_argument("--compile", nargs="+", type=str, default=["none"],
+                         choices=["none", "default", "reduce-overhead", "max-autotune"],
+                         help="torch.compile modes to sweep (default: none)")
     _add_common_args(p_sweep)
 
     # --- attention ---
@@ -548,6 +570,9 @@ def main():
     p_attn.add_argument("--d_heads", nargs="+", type=int, default=[16, 32, 64, 128])
     p_attn.add_argument("--seq_lens", nargs="+", type=int, default=[256, 1024, 4096, 8192, 16384])
     p_attn.add_argument("--output", type=str, default=None, help="Path to save CSV results")
+    p_attn.add_argument("--compile", nargs="+", type=str, default=["none"],
+                         choices=["none", "default", "reduce-overhead", "max-autotune"],
+                         help="torch.compile modes to sweep (default: none)")
     p_attn.add_argument("--profile_memory", type=str, default=None,
                          help="Path prefix for memory snapshots")
     _add_common_args(p_attn)
@@ -590,6 +615,7 @@ def main():
             device=args.device,
             output=args.output,
             test_autocast=[s == "true" for s in args.test_autocast],
+            compile_modes=getattr(args, "compile"),
         )
 
     elif args.command == "attention":
@@ -601,6 +627,7 @@ def main():
             device=args.device,
             output=args.output,
             profile_memory=args.profile_memory,
+            compile_modes=getattr(args, "compile"),
         )
 
 
