@@ -5,6 +5,8 @@ import triton.language as tl
 import einx
 import math
 from jaxtyping import Float, Bool, Int
+from cs336_basics.model import scaled_dot_product_attention
+
 
 DEVICE = triton.runtime.driver.active.get_active_torch_device()
 
@@ -243,11 +245,12 @@ def flash_attn2_forward_triton(
     o_stride_b, o_stride_h, o_stride_seq, o_stride_d,
     L_stride_b, L_stride_h, L_stride_seq, 
 
-    SEQ_LEN, D, D_sqrt,
+    SEQ_LEN, D: tl.constexpr, D_sqrt,
     # Tile shape must be known at compile time
     # Br: used by Q, O and L
     # Bc: used by K, V
-    Br: tl.constexpr, Bc: tl.constexpr 
+    Br: tl.constexpr, Bc: tl.constexpr,
+    IS_CAUSAL: tl.constexpr = False,
 ):
     batch_idx = tl.program_id(axis=0)
     head_idx = tl.program_id(axis=1)
@@ -306,15 +309,31 @@ def flash_attn2_forward_triton(
     l_i = tl.zeros((Br, ), dtype=tl.float32)
     O = tl.zeros((Br, D), dtype=tl.float32)
 
-    T_c = tl.cdiv(SEQ_LEN, Bc)
+    # For causal masking: all elements in the S matrix where col > row
+    # are zero. For a given row (seq_idx), there are Bc blocks that
+    # contain entirely elements whose col > row, so we exclude them from
+    # the j forloop.
+    if IS_CAUSAL:
+        largest_q_idx_Br = tl.minimum((i + 1) * Br - 1, SEQ_LEN - 1)
+        T_c = tl.cdiv(largest_q_idx_Br + 1, Bc)
+    else:
+        T_c = tl.cdiv(SEQ_LEN, Bc)
     for j in range(T_c):
         K_j = tl.load(k_block_ptr, boundary_check=(0, 1), padding_option="zero")
         V_j = tl.load(v_block_ptr, boundary_check=(0, 1), padding_option="zero")
 
-        S_ij = Q_i @ tl.trans(K_j) / D_sqrt
-        m_i_new = tl.max(m_i, tl.max(S_ij, axis=1, keepdim=False))
+        S_ij = tl.dot(Q_i, tl.trans(K_j)) / D_sqrt
+
+        # Causal masking within (Br, Bc) matrix
+        if IS_CAUSAL:
+            q_indices = i * Br + tl.arange(0, Br)   # (Br,)
+            k_indices = j * Bc + tl.arange(0, Bc)   # (Bc,)
+            causal_mask = q_indices[:, None] >= k_indices[None, :]  # (Br, Bc)
+            S_ij = tl.where(causal_mask, S_ij, float('-inf'))
+
+        m_i_new = tl.maximum(m_i, tl.max(S_ij, axis=1))
         P_i = tl.exp(S_ij - m_i_new[:, None])
-        l_i = tl.exp(m_i - m_i_new) * l_i + tl.sum(P_i, axis=1, keepdim=False)
+        l_i = tl.exp(m_i - m_i_new) * l_i + tl.sum(P_i, axis=1)
 
         # Rescale O: the accumulated O contains terms of the form e^{S - m_old} @ V.
         # To convert to the new max m_new, we multiply by e^{m_old - m_new}:
@@ -328,14 +347,14 @@ def flash_attn2_forward_triton(
         # which inverts the correction factor -- this appears to be an error
         # in the paper. The correct operation is multiplication by
         # $$e^{m_{old} - m_{new}}$$, not its inverse.
-        O = tl.exp(m_i - m_i_new)[:, None] * O + P_i @ V_j
+        O = tl.exp(m_i - m_i_new)[:, None] * O + tl.dot(P_i, V_j)
         m_i = m_i_new
 
-        k_block_ptr.advance((Bc, 0))
-        v_block_ptr.advance((Bc, 0))
+        k_block_ptr = tl.advance(k_block_ptr, (Bc, 0))
+        v_block_ptr = tl.advance(v_block_ptr, (Bc, 0))
         
     tl.store(o_block_ptr, O / l_i[:, None], boundary_check=(0, 1))
-    tl.store(L_block_ptr, m_i + tl.log(l_i), boundary_check=(1, ))
+    tl.store(L_block_ptr, m_i + tl.log(l_i), boundary_check=(0, ))
 
 
 class FlashAttention2Func(torch.autograd.Function):
@@ -344,7 +363,8 @@ class FlashAttention2Func(torch.autograd.Function):
         ctx, 
         q: Float[Tensor, "batch seq head d_head"],
         k: Float[Tensor, "batch seq head d_head"],
-        v: Float[Tensor, "batch seq head d_head"]
+        v: Float[Tensor, "batch seq head d_head"],
+        is_causal: bool = False,
     ) -> Float[Tensor, "batch seq head d_head"]:
 
         for x in (q, k, v):
@@ -392,9 +412,48 @@ class FlashAttention2Func(torch.autograd.Function):
             l_stride_b, l_stride_h, l_stride_seq,
 
             SEQ_LEN=SEQ_LEN, D=D_HEAD, D_sqrt=D_sqrt,
-            Br=ctx.Br, Bc=ctx.Bc
+            Br=ctx.Br, Bc=ctx.Bc,
+            IS_CAUSAL=is_causal,
         )
 
         ctx.save_for_backward(q, k, v, o, L)
         return o
 
+
+class TorchAttentionFunc(torch.autograd.Function):
+    @staticmethod
+    def forward(
+        ctx,
+        q: Float[Tensor, "batch seq head d_head"],
+        k: Float[Tensor, "batch seq head d_head"],
+        v: Float[Tensor, "batch seq head d_head"],
+        is_causal: bool = False,
+    ):
+        # q, k, v: (batch, seq, head, d_head)
+        # Transpose to (batch, head, seq, d_head) for attention
+        q_t = einx.rearrange("batch seq head d -> batch head seq d", q)
+        k_t = einx.rearrange("batch seq head d -> batch head seq d", k)
+        v_t = einx.rearrange("batch seq head d -> batch head seq d", v)
+
+        # Build causal mask if needed
+        mask = None
+        if is_causal:
+            seq_len = q.shape[1]
+            seq = torch.arange(seq_len, device=q.device)
+            mask = seq[:, None] >= seq[None, :]  # (seq, seq)
+
+        o_t = scaled_dot_product_attention(Q=q_t, K=k_t, V=v_t, mask=mask)
+
+        # Compute L (logsumexp) for backward — not returned by scaled_dot_product_attention
+        d = q.shape[-1]
+        S = torch.einsum("bhqd,bhkd->bhqk", q_t, k_t) / math.sqrt(d)
+        if mask is not None:
+            S = torch.where(mask, S, torch.tensor(float('-inf'), device=S.device))
+        L = torch.logsumexp(S, dim=-1)  # (batch, head, seq)
+
+        # Transpose back to (batch, seq, head, ...)
+        o = einx.rearrange("batch head seq d -> batch seq head d", o_t)
+        L = einx.rearrange("batch head seq -> batch seq head", L)
+
+        ctx.save_for_backward(q, k, v, o, L)
+        return o
