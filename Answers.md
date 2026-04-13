@@ -426,3 +426,220 @@ high variance for latency on xl model.
 
 The effect of compilation increases now that we add backward pass into the picture. Latency regression overall is reduced for
 smaller ctx and latency gain starts at earlier ctx. The compilation is also able to avoid OOM for xl model where ctx=512.
+
+## Problem 8: distributed_communication_single_node
+
+### Gloo/CPU
+
+```bash
+uv run python -m cs336_systems.bench_distributed --world_sizes 2 4 6 --data_sizes 1MB 10MB 100MB 1GB
+
+  ws     data    mean_ms     std_ms     min_ms    tput_MB/s
+-----------------------------------------------------------
+   2      1MB       0.44       0.14       0.25       2278.7
+   2     10MB       2.54       0.30       2.30       3941.6
+   2    100MB      23.77       1.49      22.59       4207.2
+   2      1GB     234.71       7.96     228.19       4362.9
+   4      1MB       0.78       0.17       0.65       1288.3
+   4     10MB       8.46       1.66       6.66       1182.1
+   4    100MB      68.03       2.28      65.24       1469.8
+   4      1GB     675.28      15.12     659.01       1516.4
+   6      1MB       4.77       0.33       4.32        209.7
+   6     10MB      19.96       3.65      13.69        501.0
+   6    100MB     119.49       3.35     115.56        836.9
+   6      1GB    1215.91      26.71    1183.07        842.2
+```
+
+Time and throughput are only measured by rank 0. When ws = 2, throughput for all data sizes are high. Moved to ws = 4, the
+throughput decreases more than 2x. When moved to ws=6, compared to ws=4, 100MB and 1GB decreased 1.75x (ws only increased 1.5x).
+The throughput for 1MB decreased 6x and 10MB decreased 2x. In this case, it looks like the communication overhead for n_proc
+dominates the time.
+
+## Problem 9: naive_ddp
+
+## Problem 10: naive_dpp_benchmarking
+Benchmarking the small transformer model shows that the fixed comm overhead dominates the total time.
+
+```bash
+(cs336-systems) ying-zhang@ying-zhang-B760M-DS3H-DDR4:~/workplace/cs336/cs336-assignment2-systems$ uv run python -m tests.bench_distributed naive-ddp --model_sizes small --context_lengths 128 --world_sizes 2 --num_warmup 1 --num_steps 3
+[Gloo] Rank 0 is connected to 1 peer ranks. Expected number of connected peer ranks is : 1
+[Gloo] Rank 1 is connected to 1 peer ranks. Expected number of connected peer ranks is : 1
+
+=== Naive DDP  model=small  ctx=128  world_size=2  warmup=1  steps=3 ===
+  step     fwd_ms     bwd_ms    comm_ms   comm_cnt
+------------------------------------------------
+     0     20.179     13.465    675.076        111
+     1     20.012     14.448    690.439        111
+     2     19.976     16.538    683.057        111
+
+           fwd_ms     bwd_ms    comm_ms
+  mean     20.056     14.817    682.857
+   std      0.108      1.570      7.683
+
+  Per-parameter comm (averaged over 3 steps, sorted by numel):
+         numel    size_KB    mean_ms     std_ms  name
+  ------------ ---------- ---------- ----------  ----------------------------------------
+           768        3.0      5.420      0.021  layers.0.ln1.weight
+           768        3.0      0.212      0.034  layers.0.ln2.weight
+           768        3.0      5.385      0.010  layers.1.ln1.weight
+           768        3.0      0.229      0.032  layers.1.ln2.weight
+           768        3.0      5.432      0.009  layers.2.ln1.weight
+           768        3.0      0.204      0.053  layers.2.ln2.weight
+           768        3.0      5.424      0.015  layers.3.ln1.weight
+           768        3.0      0.229      0.020  layers.3.ln2.weight
+           768        3.0      5.451      0.041  layers.4.ln1.weight
+           768        3.0      0.232      0.030  layers.4.ln2.weight
+           768        3.0      5.450      0.081  layers.5.ln1.weight
+           768        3.0      0.203      0.034  layers.5.ln2.weight
+           768        3.0      5.446      0.050  layers.6.ln1.weight
+           768        3.0      0.202      0.021  layers.6.ln2.weight
+           768        3.0      5.452      0.063  layers.7.ln1.weight
+           768        3.0      0.253      0.059  layers.7.ln2.weight
+           768        3.0      5.420      0.039  layers.8.ln1.weight
+           768        3.0      0.209      0.017  layers.8.ln2.weight
+           768        3.0      5.418      0.064  layers.9.ln1.weight
+           768        3.0      0.229      0.037  layers.9.ln2.weight
+           768        3.0      5.465      0.072  layers.10.ln1.weight
+           768        3.0      0.245      0.090  layers.10.ln2.weight
+           768        3.0      5.430      0.035  layers.11.ln1.weight
+           768        3.0      0.202      0.013  layers.11.ln2.weight
+           768        3.0      0.208      0.024  ln_final.weight
+        589824     2304.0     18.872      0.137  layers.0.attn.q_proj.weight
+        589824     2304.0      2.891      0.130  layers.0.attn.k_proj.weight
+        589824     2304.0      2.948      0.100  layers.0.attn.v_proj.weight
+        589824     2304.0      2.899      0.325  layers.0.attn.output_proj.weight
+        589824     2304.0      2.012      0.059  layers.1.attn.q_proj.weight
+        589824     2304.0      2.826      0.043  layers.1.attn.k_proj.weight
+        589824     2304.0      2.849      0.054  layers.1.attn.v_proj.weight
+        589824     2304.0      2.865      0.007  layers.1.attn.output_proj.weight
+        589824     2304.0      1.970      0.010  layers.2.attn.q_proj.weight
+        589824     2304.0      2.811      0.059  layers.2.attn.k_proj.weight
+        589824     2304.0      2.835      0.146  layers.2.attn.v_proj.weight
+        589824     2304.0      2.774      0.067  layers.2.attn.output_proj.weight
+        589824     2304.0      2.018      0.030  layers.3.attn.q_proj.weight
+        589824     2304.0      2.797      0.102  layers.3.attn.k_proj.weight
+        589824     2304.0      2.755      0.077  layers.3.attn.v_proj.weight
+        589824     2304.0      2.772      0.063  layers.3.attn.output_proj.weight
+        589824     2304.0      2.009      0.048  layers.4.attn.q_proj.weight
+        589824     2304.0      2.836      0.043  layers.4.attn.k_proj.weight
+        589824     2304.0      2.791      0.078  layers.4.attn.v_proj.weight
+        589824     2304.0      2.806      0.077  layers.4.attn.output_proj.weight
+        589824     2304.0      2.102      0.234  layers.5.attn.q_proj.weight
+        589824     2304.0      2.794      0.114  layers.5.attn.k_proj.weight
+        589824     2304.0      2.983      0.356  layers.5.attn.v_proj.weight
+        589824     2304.0      2.853      0.053  layers.5.attn.output_proj.weight
+        589824     2304.0      2.015      0.043  layers.6.attn.q_proj.weight
+        589824     2304.0      2.872      0.067  layers.6.attn.k_proj.weight
+        589824     2304.0      2.757      0.034  layers.6.attn.v_proj.weight
+        589824     2304.0      2.807      0.084  layers.6.attn.output_proj.weight
+        589824     2304.0      2.045      0.093  layers.7.attn.q_proj.weight
+        589824     2304.0      2.869      0.095  layers.7.attn.k_proj.weight
+        589824     2304.0      2.804      0.150  layers.7.attn.v_proj.weight
+        589824     2304.0      2.797      0.071  layers.7.attn.output_proj.weight
+        589824     2304.0      2.103      0.221  layers.8.attn.q_proj.weight
+        589824     2304.0      2.820      0.033  layers.8.attn.k_proj.weight
+        589824     2304.0      2.795      0.091  layers.8.attn.v_proj.weight
+        589824     2304.0      2.816      0.088  layers.8.attn.output_proj.weight
+        589824     2304.0      2.028      0.110  layers.9.attn.q_proj.weight
+        589824     2304.0      2.836      0.092  layers.9.attn.k_proj.weight
+        589824     2304.0      2.820      0.083  layers.9.attn.v_proj.weight
+        589824     2304.0      2.846      0.123  layers.9.attn.output_proj.weight
+        589824     2304.0      2.020      0.065  layers.10.attn.q_proj.weight
+        589824     2304.0      2.870      0.068  layers.10.attn.k_proj.weight
+        589824     2304.0      2.805      0.066  layers.10.attn.v_proj.weight
+        589824     2304.0      2.795      0.114  layers.10.attn.output_proj.weight
+        589824     2304.0      2.041      0.096  layers.11.attn.q_proj.weight
+        589824     2304.0      2.916      0.207  layers.11.attn.k_proj.weight
+        589824     2304.0      3.062      0.464  layers.11.attn.v_proj.weight
+        589824     2304.0      2.877      0.094  layers.11.attn.output_proj.weight
+       2359296     9216.0      8.455      0.106  layers.0.ffn.w1.weight
+       2359296     9216.0     12.913      0.114  layers.0.ffn.w2.weight
+       2359296     9216.0     12.867      0.098  layers.0.ffn.w3.weight
+       2359296     9216.0      8.478      0.068  layers.1.ffn.w1.weight
+       2359296     9216.0     12.828      0.143  layers.1.ffn.w2.weight
+       2359296     9216.0     12.766      0.030  layers.1.ffn.w3.weight
+       2359296     9216.0      8.423      0.110  layers.2.ffn.w1.weight
+       2359296     9216.0     12.885      0.100  layers.2.ffn.w2.weight
+       2359296     9216.0     12.823      0.045  layers.2.ffn.w3.weight
+       2359296     9216.0      8.389      0.090  layers.3.ffn.w1.weight
+       2359296     9216.0     12.815      0.111  layers.3.ffn.w2.weight
+       2359296     9216.0     12.795      0.057  layers.3.ffn.w3.weight
+       2359296     9216.0      8.399      0.093  layers.4.ffn.w1.weight
+       2359296     9216.0     12.770      0.075  layers.4.ffn.w2.weight
+       2359296     9216.0     12.783      0.154  layers.4.ffn.w3.weight
+       2359296     9216.0      8.724      0.433  layers.5.ffn.w1.weight
+       2359296     9216.0     12.879      0.237  layers.5.ffn.w2.weight
+       2359296     9216.0     12.804      0.067  layers.5.ffn.w3.weight
+       2359296     9216.0      8.302      0.149  layers.6.ffn.w1.weight
+       2359296     9216.0     12.928      0.205  layers.6.ffn.w2.weight
+       2359296     9216.0     13.137      0.251  layers.6.ffn.w3.weight
+       2359296     9216.0      8.560      0.278  layers.7.ffn.w1.weight
+       2359296     9216.0     12.802      0.038  layers.7.ffn.w2.weight
+       2359296     9216.0     12.868      0.158  layers.7.ffn.w3.weight
+       2359296     9216.0      8.516      0.099  layers.8.ffn.w1.weight
+       2359296     9216.0     12.786      0.082  layers.8.ffn.w2.weight
+       2359296     9216.0     12.927      0.185  layers.8.ffn.w3.weight
+       2359296     9216.0      8.548      0.265  layers.9.ffn.w1.weight
+       2359296     9216.0     12.909      0.146  layers.9.ffn.w2.weight
+       2359296     9216.0     12.929      0.196  layers.9.ffn.w3.weight
+       2359296     9216.0      8.509      0.239  layers.10.ffn.w1.weight
+       2359296     9216.0     13.139      0.014  layers.10.ffn.w2.weight
+       2359296     9216.0     13.487      1.072  layers.10.ffn.w3.weight
+       2359296     9216.0      8.476      0.118  layers.11.ffn.w1.weight
+       2359296     9216.0     12.808      0.084  layers.11.ffn.w2.weight
+       2359296     9216.0     12.884      0.211  layers.11.ffn.w3.weight
+       7680000    30000.0     34.535      3.576  token_embeddings.weight
+       7680000    30000.0     24.036      0.204  lm_head.weight
+  ------------ ---------- ----------
+     128625408   502443.0    681.421  TOTAL (111 params)
+```
+
+
+## Problem 11: minimal_ddp_flat_benchmarking
+
+```bash
+(cs336-systems) ying-zhang@ying-zhang-B760M-DS3H-DDR4:~/workplace/cs336/cs336-assignment2-systems$ echo "=== Per-param ===" && uv run python -m tests.bench_distributed naive-ddp --model_sizes small --context_lengths 128 --world_sizes 2 --num_warmup 1 --num_steps 3 --batch
+=== Per-param ===
+[Gloo] Rank 1 is connected to 1 peer ranks. Expected number of connected peer ranks is : 1
+[Gloo] Rank 0 is connected to 1 peer ranks. Expected number of connected peer ranks is : 1
+
+=== Naive DDP  model=small  ctx=128  world_size=2  warmup=1  steps=3 ===
+  step     fwd_ms     bwd_ms    comm_ms   comm_cnt
+------------------------------------------------
+     0     21.927     14.446    403.275          1
+     1     19.608    286.439    409.234          1
+     2     19.711    287.558    415.224          1
+
+           fwd_ms     bwd_ms    comm_ms
+  mean     20.415    196.147    409.244
+   std      1.310    157.359      5.975
+
+  Per-parameter comm (averaged over 3 steps, sorted by numel):
+         numel    size_KB    mean_ms     std_ms  name
+  ------------ ---------- ---------- ----------  ----------------------------------------
+     128625408   502443.0    407.553      6.202  flat_bucket(111 params)
+  ------------ ---------- ----------
+     128625408   502443.0    407.553  TOTAL (1 params)
+```
+
+## Problem 13: ddp_bucket_benchmarking
+### (a) benchmark result
+```
+  ┌────────────────┬────────┬────────┬─────────┬───────┐                                                                                                                        
+  │      Mode      │ fwd_ms │ bwd_ms │ comm_ms │ total │                                                                                                                      
+  ├────────────────┼────────┼────────┼─────────┼───────┤                                                                                                                        
+  │ Per-param      │ 21.3   │ 15.1   │ 725.6   │ 762   │                                                                                                                        
+  ├────────────────┼────────┼────────┼─────────┼───────┤                                                                                                                        
+  │ Flat batch     │ 21.4   │ 286.1  │ 494.6   │ 802   │                                                                                                                        
+  ├────────────────┼────────┼────────┼─────────┼───────┤                                                                                                                        
+  │ Bucketed async │ 23.1   │ 83.4   │ 337.0   │ 443   │                                                                                                                        
+  └────────────────┴────────┴────────┴─────────┴───────┘  
+```
+
+Not sure why exactly the bwd_ms for flat batch is higher than per-param and bucketed
+
+### (b) formula
+additional time t:
+t = b/(n*w) + o*n
+
+The additional time is the comm time for exactl one bucket plus per-bucket comm overhead.
